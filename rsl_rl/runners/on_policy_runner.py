@@ -22,6 +22,7 @@ from rsl_rl.modules import (
     StudentTeacherRecurrent,
 )
 from rsl_rl.utils import store_code_state
+from rsl_rl.networks import Memory
 
 
 class OnPolicyRunner:
@@ -70,7 +71,13 @@ class OnPolicyRunner:
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
-            num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
+            num_obs - 3, num_privileged_obs - 3, self.env.num_actions, **self.policy_cfg
+        ).to(self.device) # -3 for the true position of the cube
+
+        # add traj classifier
+        classifier_memory = Memory(num_obs - 3, type="lstm", num_layers=2, hidden_size=256) # -3 for the true position of the cube
+        classifier_mlp: torch.nn.Module = torch.nn.Sequential(
+            torch.nn.Linear(256, 3),
         ).to(self.device)
 
         # resolve dimension of rnd gated state
@@ -93,7 +100,7 @@ class OnPolicyRunner:
 
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        self.alg: PPO | Distillation = alg_class(policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+        self.alg: PPO | Distillation = alg_class(policy, classifier_mlp, classifier_memory, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -113,8 +120,8 @@ class OnPolicyRunner:
             self.training_type,
             self.env.num_envs,
             self.num_steps_per_env,
-            [num_obs],
-            [num_privileged_obs],
+            [num_obs - 3], # -3 for the true position of the cube
+            [num_privileged_obs - 3], # -3 for the true position of the cube
             [self.env.num_actions],
         )
 
@@ -411,6 +418,13 @@ class OnPolicyRunner:
 
         # save model
         torch.save(saved_dict, path)
+
+        # -- Save classifier model
+        classifier_path = os.path.join(os.path.dirname(path), "classifier.pt")
+        torch.save(self.alg.classifier.state_dict(), classifier_path)
+
+        if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
+            self.writer.save_model(classifier_path, self.current_learning_iteration)
 
         # upload model to external logging service
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:

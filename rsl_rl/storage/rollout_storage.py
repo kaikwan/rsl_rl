@@ -25,6 +25,7 @@ class RolloutStorage:
             self.action_sigma = None
             self.hidden_states = None
             self.rnd_state = None
+            self.true_target_state = None
 
         def clear(self):
             self.__init__()
@@ -61,6 +62,7 @@ class RolloutStorage:
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+        self.true_target_state = torch.zeros(num_transitions_per_env, num_envs, 3, device=self.device)
 
         # for distillation
         if training_type == "distillation":
@@ -82,6 +84,7 @@ class RolloutStorage:
         # For RNN networks
         self.saved_hidden_states_a = None
         self.saved_hidden_states_c = None
+        self.saved_hidden_states_cl = None
 
         # counter for the number of transitions stored
         self.step = 0
@@ -98,6 +101,7 @@ class RolloutStorage:
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        self.true_target_state[self.step].copy_(transition.true_target_state)
 
         # for distillation
         if self.training_type == "distillation":
@@ -121,11 +125,12 @@ class RolloutStorage:
         self.step += 1
 
     def _save_hidden_states(self, hidden_states):
-        if hidden_states is None or hidden_states == (None, None):
+        if hidden_states is None or hidden_states == (None, None, None):
             return
         # make a tuple out of GRU hidden state sto match the LSTM format
         hid_a = hidden_states[0] if isinstance(hidden_states[0], tuple) else (hidden_states[0],)
         hid_c = hidden_states[1] if isinstance(hidden_states[1], tuple) else (hidden_states[1],)
+        hid_cl = hidden_states[2] if isinstance(hidden_states[2], tuple) else (hidden_states[2],)
         # initialize if needed
         if self.saved_hidden_states_a is None:
             self.saved_hidden_states_a = [
@@ -134,10 +139,14 @@ class RolloutStorage:
             self.saved_hidden_states_c = [
                 torch.zeros(self.observations.shape[0], *hid_c[i].shape, device=self.device) for i in range(len(hid_c))
             ]
+            self.saved_hidden_states_cl = [
+                torch.zeros(self.observations.shape[0], *hid_cl[i].shape, device=self.device) for i in range(len(hid_cl))
+            ]
         # copy the states
         for i in range(len(hid_a)):
             self.saved_hidden_states_a[i][self.step].copy_(hid_a[i])
             self.saved_hidden_states_c[i][self.step].copy_(hid_c[i])
+            self.saved_hidden_states_cl[i][self.step].copy_(hid_cl[i])
 
     def clear(self):
         self.step = 0
@@ -180,69 +189,71 @@ class RolloutStorage:
                 i
             ], self.dones[i]
 
-    # for reinforcement learning with feedforward networks
-    def mini_batch_generator(self, num_mini_batches, num_epochs=8):
-        if self.training_type != "rl":
-            raise ValueError("This function is only available for reinforcement learning training.")
-        batch_size = self.num_envs * self.num_transitions_per_env
-        mini_batch_size = batch_size // num_mini_batches
-        indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
+    # # for reinforcement learning with feedforward networks
+    # def mini_batch_generator(self, num_mini_batches, num_epochs=8):
+    #     if self.training_type != "rl":
+    #         raise ValueError("This function is only available for reinforcement learning training.")
+    #     batch_size = self.num_envs * self.num_transitions_per_env
+    #     mini_batch_size = batch_size // num_mini_batches
+    #     indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
 
-        # Core
-        observations = self.observations.flatten(0, 1)
-        if self.privileged_observations is not None:
-            privileged_observations = self.privileged_observations.flatten(0, 1)
-        else:
-            privileged_observations = observations
+    #     # Core
+    #     observations = self.observations.flatten(0, 1)
+    #     if self.privileged_observations is not None:
+    #         privileged_observations = self.privileged_observations.flatten(0, 1)
+    #     else:
+    #         privileged_observations = observations
 
-        actions = self.actions.flatten(0, 1)
-        values = self.values.flatten(0, 1)
-        returns = self.returns.flatten(0, 1)
+    #     actions = self.actions.flatten(0, 1)
+    #     values = self.values.flatten(0, 1)
+    #     returns = self.returns.flatten(0, 1)
+    #     true_target_pose = self.true_target_state.flatten(0, 1)
 
-        # For PPO
-        old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
-        advantages = self.advantages.flatten(0, 1)
-        old_mu = self.mu.flatten(0, 1)
-        old_sigma = self.sigma.flatten(0, 1)
+    #     # For PPO
+    #     old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
+    #     advantages = self.advantages.flatten(0, 1)
+    #     old_mu = self.mu.flatten(0, 1)
+    #     old_sigma = self.sigma.flatten(0, 1)
 
-        # For RND
-        if self.rnd_state_shape is not None:
-            rnd_state = self.rnd_state.flatten(0, 1)
+    #     # For RND
+    #     if self.rnd_state_shape is not None:
+    #         rnd_state = self.rnd_state.flatten(0, 1)
 
-        for epoch in range(num_epochs):
-            for i in range(num_mini_batches):
-                # Select the indices for the mini-batch
-                start = i * mini_batch_size
-                end = (i + 1) * mini_batch_size
-                batch_idx = indices[start:end]
+    #     for epoch in range(num_epochs):
+    #         for i in range(num_mini_batches):
+    #             # Select the indices for the mini-batch
+    #             start = i * mini_batch_size
+    #             end = (i + 1) * mini_batch_size
+    #             batch_idx = indices[start:end]
 
-                # Create the mini-batch
-                # -- Core
-                obs_batch = observations[batch_idx]
-                privileged_observations_batch = privileged_observations[batch_idx]
-                actions_batch = actions[batch_idx]
+    #             # Create the mini-batch
+    #             # -- Core
+    #             obs_batch = observations[batch_idx]
+    #             privileged_observations_batch = privileged_observations[batch_idx]
+    #             actions_batch = actions[batch_idx]
+    #             true_target_pose_batch = true_target_pose[batch_idx]
 
-                # -- For PPO
-                target_values_batch = values[batch_idx]
-                returns_batch = returns[batch_idx]
-                old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
-                advantages_batch = advantages[batch_idx]
-                old_mu_batch = old_mu[batch_idx]
-                old_sigma_batch = old_sigma[batch_idx]
+    #             # -- For PPO
+    #             target_values_batch = values[batch_idx]
+    #             returns_batch = returns[batch_idx]
+    #             old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
+    #             advantages_batch = advantages[batch_idx]
+    #             old_mu_batch = old_mu[batch_idx]
+    #             old_sigma_batch = old_sigma[batch_idx]
 
-                # -- For RND
-                if self.rnd_state_shape is not None:
-                    rnd_state_batch = rnd_state[batch_idx]
-                else:
-                    rnd_state_batch = None
+    #             # -- For RND
+    #             if self.rnd_state_shape is not None:
+    #                 rnd_state_batch = rnd_state[batch_idx]
+    #             else:
+    #                 rnd_state_batch = None
 
-                # yield the mini-batch
-                yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
-                    None,
-                    None,
-                ), None, rnd_state_batch
+    #             # yield the mini-batch
+    #             yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+    #                 None,
+    #                 None,
+    #             ), None, rnd_state_batch, true_target_pose_batch
 
-    # for reinfrocement learning with recurrent networks
+    # for reinforcement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
@@ -287,6 +298,7 @@ class RolloutStorage:
                 advantages_batch = self.advantages[:, start:stop]
                 values_batch = self.values[:, start:stop]
                 old_actions_log_prob_batch = self.actions_log_prob[:, start:stop]
+                true_target_pose_batch = self.true_target_state[:, start:stop]
 
                 # reshape to [num_envs, time, num layers, hidden dim] (original shape: [time, num_layers, num_envs, hidden_dim])
                 # then take only time steps after dones (flattens num envs and time dimensions),
@@ -304,13 +316,21 @@ class RolloutStorage:
                     .contiguous()
                     for saved_hidden_states in self.saved_hidden_states_c
                 ]
+                hid_cl_batch = [
+                    saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                    .transpose(1, 0)
+                    .contiguous()
+                    for saved_hidden_states in self.saved_hidden_states_cl
+                ]
                 # remove the tuple for GRU
                 hid_a_batch = hid_a_batch[0] if len(hid_a_batch) == 1 else hid_a_batch
                 hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
+                hid_cl_batch = hid_cl_batch[0] if len(hid_cl_batch) == 1 else hid_cl_batch
 
                 yield obs_batch, privileged_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     hid_a_batch,
                     hid_c_batch,
-                ), masks_batch, rnd_state_batch
+                    hid_cl_batch,
+                ), masks_batch, rnd_state_batch, true_target_pose_batch
 
                 first_traj = last_traj

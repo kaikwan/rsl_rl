@@ -14,17 +14,21 @@ from rsl_rl.modules import ActorCritic
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
-
+from rsl_rl.networks import Memory
 
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
     policy: ActorCritic
+    classifier_mlp: nn.Module
+    classifier_memory: Memory
     """The actor critic module."""
 
     def __init__(
         self,
         policy,
+        classifier_mlp,
+        classifier_memory,
         num_learning_epochs=1,
         num_mini_batches=1,
         clip_param=0.2,
@@ -92,8 +96,17 @@ class PPO:
         # PPO components
         self.policy = policy
         self.policy.to(self.device)
+
+        self.classifier_mlp = classifier_mlp
+        self.classifier_memory = classifier_memory
+        self.classifier_mlp.to(self.device)
+        self.classifier_memory.to(self.device)
+        self.classifier = nn.Sequential(self.classifier_memory, self.classifier_mlp)
+        print(f"Classifier: {nn.Sequential(self.classifier_memory, self.classifier_mlp)}")
+
         # Create optimizer
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        self.classifier_optimizer = optim.Adam(self.classifier.parameters(), lr=learning_rate)
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
@@ -135,8 +148,14 @@ class PPO:
 
     def act(self, obs, critic_obs):
         if self.policy.is_recurrent:
-            self.transition.hidden_states = self.policy.get_hidden_states()
+            self.transition.hidden_states = (self.policy.get_hidden_states()[0], self.policy.get_hidden_states()[1], self.classifier_memory.hidden_states)
+        true_target_pose = obs[:, -3:]
+        obs = obs[:, :-3]
+        critic_obs = critic_obs[:, :-3]
+
         # compute the actions and values
+        pred_state = self.classifier_memory(obs)
+        pred_state = self.classifier_mlp(pred_state)
         self.transition.actions = self.policy.act(obs).detach()
         self.transition.values = self.policy.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
@@ -145,6 +164,7 @@ class PPO:
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.privileged_observations = critic_obs
+        self.transition.true_target_state = true_target_pose
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
@@ -175,8 +195,10 @@ class PPO:
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.policy.reset(dones)
+        self.classifier_memory.reset(dones)
 
     def compute_returns(self, last_critic_obs):
+        last_critic_obs = last_critic_obs[:, :-3]
         # compute value for the last step
         last_values = self.policy.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(
@@ -218,6 +240,7 @@ class PPO:
             hid_states_batch,
             masks_batch,
             rnd_state_batch,
+            true_target_state_batch,
         ) in generator:
 
             # number of augmentations per sample
@@ -399,6 +422,23 @@ class PPO:
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
 
+            # -- For Traj Classifier
+            # compute the classifier loss
+            mem_res = self.classifier_memory(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[2])
+            pred_state = self.classifier_mlp(mem_res.squeeze(0))
+            # compute the loss
+            mseloss = torch.nn.MSELoss()
+            # get true target state
+            true_target_state = true_target_state_batch
+            classifier_loss = mseloss(pred_state, true_target_state)
+            # accuracy, consider all within 5e-2 ball around the target is correct
+            classifier_accuracy = torch.mean(
+                torch.where(torch.norm(pred_state - true_target_state, dim=1) < 5e-2, 1.0, 0.0)
+            ).item()
+            self.classifier_optimizer.zero_grad()
+            classifier_loss.backward()
+            self.classifier_optimizer.step()
+
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
@@ -418,6 +458,8 @@ class PPO:
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "classifier": classifier_loss,
+            "classifier_accuracy": classifier_accuracy,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
