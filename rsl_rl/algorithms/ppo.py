@@ -270,13 +270,19 @@ class PPO:
             # KL
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
-                    kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                        + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
-                        / (2.0 * torch.square(sigma_batch))
-                        - 0.5,
-                        axis=-1,
-                    )
+                    # Check if this is a GCU actor-critic with custom KL divergence
+                    if hasattr(self.policy, 'compute_kl_divergence'):
+                        # Use custom KL divergence for mixed distribution
+                        kl = self.policy.compute_kl_divergence(old_mu_batch, old_sigma_batch)
+                    else:
+                        # Use standard KL divergence for Gaussian distribution
+                        kl = torch.sum(
+                            torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
+                            + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
+                            / (2.0 * torch.square(sigma_batch))
+                            - 0.5,
+                            axis=-1,
+                        )
                     kl_mean = torch.mean(kl)
 
                     # Reduce the KL divergence across all GPUs
