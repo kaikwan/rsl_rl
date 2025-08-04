@@ -43,7 +43,6 @@ class GCUOnPolicyRunner(OnPolicyRunnerConv2d):
         super().__init__(env, train_cfg, log_dir, device)
         self.tote_manager = env.unwrapped.tote_manager
         self.num_obj_per_env = self.tote_manager.num_objects
-        self.num_totes = len([key for key in env.unwrapped.scene.keys() if key.startswith("tote")])
 
         args = {
             "decreasing_vol": False,  # Whether to use decreasing volume for packing
@@ -57,7 +56,5 @@ class GCUOnPolicyRunner(OnPolicyRunnerConv2d):
             self.tote_manager, env.num_envs, torch.arange(self.num_obj_per_env, device=env.unwrapped.device), **args
         )
         env.unwrapped.bpp = self.bpp
-        self.tote_ids = torch.arange(env.num_envs, device=env.unwrapped.device) % self.num_totes
-        self.env_indices = torch.arange(env.num_envs, device=env.unwrapped.device)
-        
+
 

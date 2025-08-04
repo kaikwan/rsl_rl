@@ -207,7 +207,7 @@ class OnPolicyRunnerConv2d(OnPolicyRunner):
                     # Sample actions
                     actions = self.alg.act(obs, critic_obs)
                     # Step the environment
-                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device), image_obs=image_obs)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     
