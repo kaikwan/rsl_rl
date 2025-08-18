@@ -33,7 +33,7 @@ from rsl_rl.runners import OnPolicyRunnerConv2d
 class GCUOnPolicyRunner(OnPolicyRunnerConv2d):
     """Runner for on-policy algorithms in GCU environments."""
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
-        env.num_actions = 4 # Override the number of actions to 4 fpr policy
+        env.num_actions = 5 # Override the number of actions to 5 fpr policy
         super().__init__(env, train_cfg, log_dir, device)
 
 
