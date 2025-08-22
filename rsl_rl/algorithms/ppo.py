@@ -32,6 +32,7 @@ class PPO:
         lam=0.95,
         value_loss_coef=1.0,
         entropy_coef=0.0,
+        mixture_entropy_coef=0.02,  # Coefficient for mixture entropy regularization
         learning_rate=1e-3,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
@@ -106,6 +107,7 @@ class PPO:
         self.num_mini_batches = num_mini_batches
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
+        self.mixture_entropy_coef = mixture_entropy_coef
         self.gamma = gamma
         self.lam = lam
         self.max_grad_norm = max_grad_norm
@@ -331,6 +333,21 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
+            # Mixture entropy regularization to encourage high-entropy mixture weights
+            if self.mixture_entropy_coef > 0 and hasattr(self.policy, 'rotation_dist') and self.policy.rotation_dist is not None:
+                # Compute categorical entropy over mixture components
+                from torch.distributions import Categorical
+                cat = Categorical(self.policy.rotation_dist.mixture_probs)
+                cat_entropy = cat.entropy()[:original_batch_size]  # Slice to match other entropy values
+                cat_entropy = cat_entropy.mean()
+                # Add regularization term to encourage using different mixture components
+                loss = loss - self.mixture_entropy_coef * cat_entropy
+                
+                # Store mixture entropy for logging
+                self.mixture_entropy = cat_entropy.item()
+            else:
+                self.mixture_entropy = 0.0
+
             # Symmetry loss
             if self.symmetry:
                 # obtain the symmetric actions
@@ -431,6 +448,8 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if self.mixture_entropy_coef > 0:
+            loss_dict["mixture_entropy"] = self.mixture_entropy
 
         return loss_dict
 
