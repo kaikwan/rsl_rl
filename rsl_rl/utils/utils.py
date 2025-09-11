@@ -139,3 +139,13 @@ def string_to_callable(name: str) -> Callable:
             f" 'module:attribute_name'\nWhile processing input '{name}', received the error:\n {e}."
         )
         raise ValueError(msg)
+
+def normalize_and_flatten_image_obs(image_tensor):
+    """Normalize image observations and return a flattened tensor.
+
+    Expects input in NHWC. Applies the same normalization used inline previously.
+    """
+    image_obs = image_tensor.permute(0, 3, 1, 2).flatten(start_dim=1)
+    image_obs_normalized = (20 - image_obs) / 0.5
+    image_obs_normalized = image_obs_normalized.flatten(start_dim=1)
+    return image_obs_normalized

@@ -11,4 +11,5 @@ from .utils import (
     store_code_state,
     string_to_callable,
     unpad_trajectories,
+    normalize_and_flatten_image_obs,
 )

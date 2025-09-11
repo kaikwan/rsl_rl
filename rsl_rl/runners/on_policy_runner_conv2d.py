@@ -16,7 +16,7 @@ from rsl_rl.env import VecEnv
 from rsl_rl.modules import EmpiricalNormalization, GCUActorCritic
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils import store_code_state
-
+from rsl_rl.utils import normalize_and_flatten_image_obs
 
 class OnPolicyRunnerConv2d(OnPolicyRunner):
     """Custom on-policy runner for training and evaluation with convolutional actor-critic."""
@@ -104,10 +104,12 @@ class OnPolicyRunnerConv2d(OnPolicyRunner):
         if self.empirical_normalization:
             self.obs_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8).to(self.device)
             self.critic_obs_normalizer = EmpiricalNormalization(shape=[num_critic_obs], until=1.0e8).to(self.device)
+            self.image_obs_normalizer = EmpiricalNormalization(shape=[num_image_obs], until=1.0e8).to(self.device)
+            self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], until=1.0e8).to(self.device)
         else:
             self.obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
             self.critic_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
-
+            
         # init storage and model
         self.alg.init_storage(
             self.training_type,
@@ -169,9 +171,9 @@ class OnPolicyRunnerConv2d(OnPolicyRunner):
         critic_obs = extras["observations"].get("critic", obs)
 
         image_obs = extras["observations"]["sensor"].permute(0, 3, 1, 2).flatten(start_dim=1)
+        obs = torch.cat([obs, normalize_and_flatten_image_obs(extras["observations"]["sensor"])], dim=1)
 
-        obs = torch.cat([obs, image_obs], dim=1)
-        critic_obs = torch.cat([critic_obs, image_obs], dim=1)
+        critic_obs = torch.cat([critic_obs, normalize_and_flatten_image_obs(extras["observations"]["sensor"])], dim=1)
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
@@ -221,8 +223,10 @@ class OnPolicyRunnerConv2d(OnPolicyRunner):
 
                     # Concatenate image observations with proprioceptive observations
                     image_obs = infos["observations"]["sensor"].permute(0, 3, 1, 2).flatten(start_dim=1).to(self.device)
-                    obs = torch.cat([obs, image_obs], dim=1)
-                    critic_obs = torch.cat([critic_obs, image_obs], dim=1)
+                    # Normalize image observations
+                    image_obs_normalized = normalize_and_flatten_image_obs(infos["observations"]["sensor"])
+                    obs = torch.cat([obs, image_obs_normalized], dim=1)
+                    critic_obs = torch.cat([critic_obs, image_obs_normalized], dim=1)
 
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
@@ -295,3 +299,32 @@ class OnPolicyRunnerConv2d(OnPolicyRunner):
         # Save the final model after training
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+
+    def get_inference_policy(self, device=None):
+        """Get the policy for inference with proper normalization for Conv2D networks."""
+        if device is not None:
+            self.alg.policy.to(device)
+        
+        policy = self.alg.policy.act_inference
+        
+        if self.cfg["empirical_normalization"]:
+            if device is not None:
+                self.obs_normalizer.to(device)
+                self.image_obs_normalizer.to(device)
+            
+            def conv2d_policy(x):
+                # Split observations into proprioceptive and image parts
+                proprio_obs = x[:, :self.obs_normalizer._mean.shape[1]]
+                image_obs = x[:, self.obs_normalizer._mean.shape[1]:]
+                
+                # Normalize only the proprioceptive part
+                normalized_proprio = self.obs_normalizer(proprio_obs)
+                
+                # Concatenate back
+                normalized_obs = torch.cat([normalized_proprio, image_obs], dim=1)
+                
+                return self.alg.policy.act_inference(normalized_obs)
+            
+            policy = conv2d_policy
+        
+        return policy
