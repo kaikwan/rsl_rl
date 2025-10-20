@@ -273,7 +273,7 @@ class PPO:
                     # Check if this is a GCU actor-critic with custom KL divergence
                     if hasattr(self.policy, 'compute_kl_divergence'):
                         # Use custom KL divergence for mixed distribution
-                        kl = self.policy.compute_kl_divergence(old_mu_batch, old_sigma_batch)
+                        kl = self.policy.compute_kl_divergence(mu_batch, sigma_batch, old_mu_batch, old_sigma_batch)
                     else:
                         # Use standard KL divergence for Gaussian distribution
                         kl = torch.sum(

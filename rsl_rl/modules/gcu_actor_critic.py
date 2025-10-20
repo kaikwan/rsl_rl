@@ -116,20 +116,22 @@ class GCUActorCritic(ActorCriticConv2d):
 
     @property
     def action_mean(self):
-        """Return the mean of the raw action output for storage compatibility."""
-        if self.distribution is None:
-            return torch.zeros(1, 4)  # Default shape
-        return self.distribution.mean
+        """Return the mean action as [x, y, onehot_orientation_0, onehot_orientation_1]."""
+        # Mean placement (continuous)
+        xy_mean = self.placement_dist.mean  # [batch, 2]
+
+        # Orientation: argmax logits → one-hot
+        orientation = torch.argmax(self.orientation_dist.logits, dim=-1)  # [batch]
+        orientation_onehot = torch.zeros_like(self.orientation_dist.logits)  # [batch, 2]
+        orientation_onehot.scatter_(1, orientation.unsqueeze(1), 1.0)
+
+        # Combine into full mean action
+        return torch.cat([xy_mean, orientation_onehot], dim=-1)  # [batch, 4]
 
     @property
     def action_std(self):
-        if self.placement_dist is None:
-            return torch.ones(1,4)
-        # build a 4‑vector: [σ_x, σ_y, 0, 0]  (or whatever makes sense for the discrete part)
-        std_xy = self.placement_dist.stddev
-        zeros = torch.zeros_like(self.orientation_dist.logits)
-        return torch.cat([std_xy, zeros], dim=-1)
-
+        """Return std for placement only; keep categorical entropy separately."""
+        return self.placement_dist.stddev
 
     @property
     def entropy(self):
@@ -162,41 +164,38 @@ class GCUActorCritic(ActorCriticConv2d):
         
         return actions
 
-    def compute_kl_divergence(self, old_mu, old_sigma):
-        """Compute KL divergence for mixed distribution (Gaussian placement + categorical orientation)."""
+    def compute_kl_divergence(self, mu, sigma, old_mu, old_sigma):
+        """Compute KL divergence between old and current policy (Gaussian + categorical)."""
         if self.placement_dist is None or self.orientation_dist is None:
             return torch.tensor(0.0, device=self.device)
-        
-        # Extract placement parameters from old distribution
-        old_mu_xy = old_mu[:, :2]  # Placement means
-        old_sigma_xy = old_sigma[:, :2]  # Placement stds
-        
-        # Extract orientation logits from old distribution
-        old_logits_o = old_mu[:, 2:]  # Orientation logits
-        
-        # Compute KL divergence for placement (Gaussian)
-        current_mu_xy = self.placement_dist.mean
-        current_sigma_xy = self.placement_dist.stddev
-        
+
+        # ---- Gaussian part ----
+        mu_xy = mu[:, :2]
+        sigma_xy = sigma[:, :2]
+        old_mu_xy = old_mu[:, :2]
+        old_sigma_xy = old_sigma[:, :2]
+
         kl_placement = torch.sum(
-            torch.log(current_sigma_xy / old_sigma_xy + 1.0e-5)
-            + (torch.square(old_sigma_xy) + torch.square(old_mu_xy - current_mu_xy))
-            / (2.0 * torch.square(current_sigma_xy))
+            torch.log((sigma_xy + 1e-8) / (old_sigma_xy + 1e-8))
+            + (old_sigma_xy.pow(2) + (old_mu_xy - mu_xy).pow(2))
+            / (2.0 * sigma_xy.pow(2))
             - 0.5,
-            axis=-1,
+            dim=-1,
         )
-        
-        # Compute KL divergence for orientation (categorical)
-        current_logits_o = self.orientation_dist.logits
-        old_probs_o = torch.softmax(old_logits_o, dim=-1)
+
+        # ---- Categorical part ----
+        current_logits_o = mu[:, 2:]
+        old_logits_o = old_mu[:, 2:]
+
+        old_probs_o = torch.softmax(old_logits_o, dim=-1).detach()
         current_probs_o = torch.softmax(current_logits_o, dim=-1)
-        
+
+
         kl_orientation = torch.sum(
-            old_probs_o * (torch.log(old_probs_o + 1e-8) - torch.log(current_probs_o + 1e-8)),
-            dim=-1
+            current_probs_o * (torch.log(current_probs_o + 1e-8) - torch.log(old_probs_o + 1e-8)),
+            dim=-1,
         )
-        
-        # Total KL divergence
+
+        # ---- Combine ----
         total_kl = kl_placement + kl_orientation
-        
         return total_kl
