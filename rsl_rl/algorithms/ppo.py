@@ -32,6 +32,8 @@ class PPO:
         lam=0.95,
         value_loss_coef=1.0,
         entropy_coef=0.0,
+        placement_entropy_coef=None,
+        orientation_entropy_coef=None,
         learning_rate=1e-3,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
@@ -106,6 +108,10 @@ class PPO:
         self.num_mini_batches = num_mini_batches
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
+        # Separate entropy coefficients for placement and orientation
+        # If provided, will override entropy_coef for GCU actor-critic
+        self.placement_entropy_coef = placement_entropy_coef
+        self.orientation_entropy_coef = orientation_entropy_coef
         self.gamma = gamma
         self.lam = lam
         self.max_grad_norm = max_grad_norm
@@ -189,6 +195,15 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        # Separate entropy tracking for GCU actor-critic
+        mean_placement_entropy = 0
+        mean_orientation_entropy = 0
+        use_separate_entropy = (
+            hasattr(self.policy, 'placement_entropy') 
+            and hasattr(self.policy, 'orientation_entropy')
+            and self.placement_entropy_coef is not None
+            and self.orientation_entropy_coef is not None
+        )
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -266,6 +281,13 @@ class PPO:
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
+            # Get separate entropies if available
+            if use_separate_entropy:
+                placement_entropy_batch = self.policy.placement_entropy[:original_batch_size]
+                orientation_entropy_batch = self.policy.orientation_entropy[:original_batch_size]
+            else:
+                placement_entropy_batch = None
+                orientation_entropy_batch = None
 
             # KL
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -296,9 +318,9 @@ class PPO:
                     #       then the learning rate should be the same across all GPUs.
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                            self.learning_rate = max(1e-5, self.learning_rate / 1.1)
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                            self.learning_rate = min(1e-2, self.learning_rate * 1.1)
 
                     # Update the learning rate for all GPUs
                     if self.is_multi_gpu:
@@ -329,7 +351,16 @@ class PPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            # Compute entropy loss with separate coefficients if available
+            if use_separate_entropy:
+                entropy_loss = (
+                    self.placement_entropy_coef * placement_entropy_batch.mean()
+                    + self.orientation_entropy_coef * orientation_entropy_batch.mean()
+                )
+            else:
+                entropy_loss = self.entropy_coef * entropy_batch.mean()
+            
+            loss = surrogate_loss + self.value_loss_coef * value_loss - entropy_loss
 
             # Symmetry loss
             if self.symmetry:
@@ -400,6 +431,10 @@ class PPO:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+            # Store separate entropies if available
+            if use_separate_entropy:
+                mean_placement_entropy += placement_entropy_batch.mean().item()
+                mean_orientation_entropy += orientation_entropy_batch.mean().item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -412,6 +447,10 @@ class PPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        # Average separate entropies if available
+        if use_separate_entropy:
+            mean_placement_entropy /= num_updates
+            mean_orientation_entropy /= num_updates
         # -- For RND
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -427,6 +466,10 @@ class PPO:
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        # Add separate entropies to loss dictionary if available
+        if use_separate_entropy:
+            loss_dict["placement_entropy"] = mean_placement_entropy
+            loss_dict["orientation_entropy"] = mean_orientation_entropy
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:

@@ -26,7 +26,7 @@ from rsl_rl.modules import (
     StudentTeacherRecurrent,
 )
 from rsl_rl.utils import store_code_state
-from rsl_rl.runners import OnPolicyRunnerConv2d
+from rsl_rl.runners import OnPolicyRunnerConv2d, OnPolicyRunnerConv2dPointNet
 
 
 
@@ -36,5 +36,9 @@ class GCUOnPolicyRunner(OnPolicyRunnerConv2d):
         env.num_actions = 2 + 72 # Override the number of actions for policy
         super().__init__(env, train_cfg, log_dir, device)
 
-
+class GCUOnPolicyConv2dPointNetRunner(OnPolicyRunnerConv2dPointNet):
+    """Runner for on-policy algorithms in GCU environments with PointNet."""
+    def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
+        env.num_actions = 2 + 72 # Override the number of actions for policy
+        super().__init__(env, train_cfg, log_dir, device)
 

@@ -131,6 +131,14 @@ class OnPolicyRunnerConv2d(OnPolicyRunner):
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+        self._reward_hist_window = self.cfg.get("reward_histogram_window", 128)
+        if self.log_dir is not None and not self.disable_logs:
+            self._episode_reward_traces = [[] for _ in range(self.env.num_envs)]
+            self._historical_reward_traces = deque(maxlen=self._reward_hist_window)
+        else:
+            self._episode_reward_traces = None
+            self._historical_reward_traces = None
+        self._hist_episode_counter = 0
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer
@@ -183,6 +191,7 @@ class OnPolicyRunnerConv2d(OnPolicyRunner):
         lenbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        reward_hist_data = None
 
         # create buffers for logging extrinsic and intrinsic rewards
         if self.alg.rnd:
@@ -249,9 +258,11 @@ class OnPolicyRunnerConv2d(OnPolicyRunner):
                             cur_reward_sum += rewards
                         # Update episode length
                         cur_episode_length += 1
+                        self._track_reward_histogram_step(rewards, infos)
                         # Clear data for completed episodes
                         # -- common
                         new_ids = (dones > 0).nonzero(as_tuple=False)
+                        self._finalize_reward_histogram_episodes(new_ids)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
@@ -279,6 +290,7 @@ class OnPolicyRunnerConv2d(OnPolicyRunner):
             self.current_learning_iteration = it
             # log info
             if self.log_dir is not None and not self.disable_logs:
+                reward_hist_data = self._collect_reward_histogram_data()
                 # Log information
                 self.log(locals())
                 # Save model

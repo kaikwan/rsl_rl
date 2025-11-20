@@ -7,7 +7,9 @@
 
 from .actor_critic import ActorCritic
 from .actor_critic_conv2d import ActorCriticConv2d
+from .actor_critic_conv2d_pointnet import ActorCriticConv2dPointNet
 from .gcu_actor_critic import GCUActorCritic
+from .gcu_actor_critic_conv2d_pointnet import GCUActorCriticConv2dPointNet
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .normalizer import EmpiricalNormalization
 from .rnd import RandomNetworkDistillation
@@ -17,7 +19,9 @@ from .student_teacher_recurrent import StudentTeacherRecurrent
 __all__ = [
     "ActorCritic",
     "ActorCriticConv2d",
+    "ActorCriticConv2dPointNet",
     "GCUActorCritic",
+    "GCUActorCriticConv2dPointNet",
     "ActorCriticRecurrent",
     "EmpiricalNormalization",
     "RandomNetworkDistillation",

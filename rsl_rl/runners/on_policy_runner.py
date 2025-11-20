@@ -9,6 +9,7 @@ import os
 import statistics
 import time
 import torch
+import numpy as np
 from collections import deque
 
 import rsl_rl
@@ -23,7 +24,9 @@ from rsl_rl.modules import (
     StudentTeacherRecurrent,
 )
 from rsl_rl.utils import store_code_state
-
+import matplotlib
+matplotlib.use("Agg")  # Use non-interactive backend to avoid tkinter issues
+import matplotlib.pyplot as plt  # type: ignore
 
 class OnPolicyRunner:
     """On-policy runner for training and evaluation."""
@@ -131,6 +134,18 @@ class OnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+        # Reward histogram tracking
+        self._reward_hist_window = self.cfg.get("reward_histogram_window", 128)
+        if self.log_dir is not None and not self.disable_logs:
+            self._episode_reward_traces = [[] for _ in range(self.env.num_envs)]
+            self._historical_reward_traces = deque(maxlen=self._reward_hist_window)
+        else:
+            self._episode_reward_traces = None
+            self._historical_reward_traces = None
+        self._hist_episode_counter = 0
+        self._reward_hist_warned_no_traces = False
+        self._reward_hist_warned_no_history = False
+        self._reward_hist_warned_no_data = False
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer
@@ -178,6 +193,7 @@ class OnPolicyRunner:
         lenbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        reward_hist_data = None
 
         # create buffers for logging extrinsic and intrinsic rewards
         if self.alg.rnd:
@@ -237,9 +253,12 @@ class OnPolicyRunner:
                             cur_reward_sum += rewards
                         # Update episode length
                         cur_episode_length += 1
+                        # Track rewards for histogram visualization
+                        self._track_reward_histogram_step(rewards, infos)
                         # Clear data for completed episodes
                         # -- common
                         new_ids = (dones > 0).nonzero(as_tuple=False)
+                        self._finalize_reward_histogram_episodes(new_ids)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
@@ -267,8 +286,13 @@ class OnPolicyRunner:
             self.current_learning_iteration = it
             # log info
             if self.log_dir is not None and not self.disable_logs:
+                reward_hist_data = self._collect_reward_histogram_data()
+                if reward_hist_data is None and not self._reward_hist_warned_no_data:
+                    self._reward_hist_warned_no_data = True
                 # Log information
                 self.log(locals())
+                # Clear reward histogram data after logging
+                self._clear_reward_histogram_data()
                 # Save model
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
@@ -350,6 +374,8 @@ class OnPolicyRunner:
                 self.writer.add_scalar(
                     "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
                 )
+        # -- Reward histogram visualization
+        self._log_reward_histogram(locs, iteration=locs["it"])
 
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
@@ -399,6 +425,245 @@ class OnPolicyRunner:
             )}\n"""
         )
         print(log_string)
+
+    def _track_reward_histogram_step(self, rewards: torch.Tensor, infos: dict = None):
+        if self._episode_reward_traces is None:
+            if not self._reward_hist_warned_no_traces:
+                self._reward_hist_warned_no_traces = True
+            return
+        # Track reward components if available in infos
+        reward_components = {}
+        
+        # Check for reward_terms (step-level rewards)
+        reward_manager = self.env.unwrapped.reward_manager
+        if hasattr(reward_manager, 'get_step_reward_terms'):
+            step_terms = reward_manager.get_step_reward_terms()
+
+            # Track ALL terms (including unused_ ones) - filtering happens later in visualization
+            for term_name, term_values in step_terms.items():
+                if isinstance(term_values, torch.Tensor):
+                    reward_components[term_name] = term_values.detach().view(-1).cpu().tolist()
+                else:
+                    reward_components[term_name] = [term_values] * self.env.num_envs
+
+        rewards_flat = rewards.detach().view(-1).cpu().tolist()
+        for env_idx, reward_value in enumerate(rewards_flat):
+            # Store total reward and components
+            reward_data = {"total": float(reward_value)}
+            for term_name, term_values in reward_components.items():
+                if env_idx < len(term_values):
+                    reward_data[term_name] = float(term_values[env_idx])
+            
+            self._episode_reward_traces[env_idx].append(reward_data)
+
+    def _finalize_reward_histogram_episodes(self, done_ids: torch.Tensor):
+        if (
+            self._episode_reward_traces is None
+            or self._historical_reward_traces is None
+            or done_ids is None
+            or done_ids.numel() == 0
+        ):
+            if self._historical_reward_traces is None and not self._reward_hist_warned_no_history:
+                self._reward_hist_warned_no_history = True
+            return
+        done_cpu = done_ids.cpu()
+        if done_cpu.dim() == 2:
+            env_indices = done_cpu[:, 0].tolist()
+        else:
+            env_indices = done_cpu.view(-1).tolist()
+        for env_idx in env_indices:
+            if env_idx < 0 or env_idx >= len(self._episode_reward_traces):
+                continue
+            trace = self._episode_reward_traces[env_idx]
+            if trace:
+                self._historical_reward_traces.append(list(trace))
+                self._hist_episode_counter += 1
+                self._episode_reward_traces[env_idx] = []
+
+    def _collect_reward_histogram_data(self):
+        if self._historical_reward_traces is None or len(self._historical_reward_traces) == 0:
+            if self._historical_reward_traces is None and not self._reward_hist_warned_no_history:
+                self._reward_hist_warned_no_history = True
+            return None
+        
+        steps: list[int] = []
+        rewards: list[float] = []
+        reward_components: dict[str, list[float]] = {}
+        
+        for episode in self._historical_reward_traces:
+            for step_idx, step_data in enumerate(episode):
+                steps.append(step_idx + 1)
+                
+                if isinstance(step_data, dict):
+                    # New format with component breakdown
+                    rewards.append(step_data.get("total", 0.0))
+                    for term_name, term_value in step_data.items():
+                        if term_name != "total":
+                            if term_name not in reward_components:
+                                reward_components[term_name] = []
+                            reward_components[term_name].append(term_value)
+                else:
+                    # Old format - just total reward
+                    rewards.append(float(step_data))
+        
+        if not steps:
+            return None
+            
+        steps_tensor = torch.tensor(steps, dtype=torch.float32, device="cpu")
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device="cpu")
+        
+        # Convert reward components to tensors
+        components_tensor = {}
+        for term_name, term_values in reward_components.items():
+            if len(term_values) == len(steps):  # Ensure we have data for all steps
+                components_tensor[term_name] = torch.tensor(term_values, dtype=torch.float32, device="cpu")
+        
+        return steps_tensor, rewards_tensor, self._hist_episode_counter, components_tensor
+
+    def _log_reward_histogram(self, locs: dict, iteration: int):
+        if self.writer is None:
+            return
+        reward_hist_data = locs.get("reward_hist_data")
+        if reward_hist_data is None:
+            return
+        
+        # Handle both old and new format
+        if len(reward_hist_data) == 3:
+            steps_tensor, rewards_tensor, episode_counter = reward_hist_data
+            components_tensor = {}
+        else:
+            steps_tensor, rewards_tensor, episode_counter, components_tensor = reward_hist_data
+            
+        if steps_tensor.numel() == 0 or rewards_tensor.numel() == 0:
+            return
+        steps = steps_tensor.cpu().numpy()
+        rewards = rewards_tensor.cpu().numpy()
+        if steps.size == 0 or rewards.size == 0:
+            return
+            
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Calculate mean reward components for each timestep
+        unique_steps = np.unique(steps)
+        
+        if components_tensor:
+            # Individual bar chart for each component (side by side)
+            component_means = {}
+            # Filter out unused terms for the main combined plot
+            filtered_components = {k: v for k, v in components_tensor.items() if not k.startswith("unused_")}
+            
+            for term_name, term_tensor in components_tensor.items():
+                term_values = term_tensor.cpu().numpy()
+                component_means[term_name] = []
+                for step in unique_steps:
+                    step_mask = steps == step
+                    mean_value = np.mean(term_values[step_mask])
+                    component_means[term_name].append(mean_value)
+            
+            # Calculate bar positioning (only for non-unused terms)
+            num_terms = len(filtered_components)
+            if num_terms > 0:
+                bar_width = 0.8 / num_terms  # Divide width among terms
+                colors = plt.cm.tab10(np.linspace(0, 1, num_terms))
+                
+                # Plot each reward term as separate bars (excluding unused terms)
+                idx = 0
+                for term_name, term_tensor in filtered_components.items():
+                    values = np.array(component_means[term_name])
+                    # Offset each term's bars
+                    x_offset = unique_steps + (idx - num_terms/2 + 0.5) * bar_width
+                    term_color = colors[idx]
+                    
+                    # Split positive and negative values
+                    positive_values = np.maximum(values, 0)
+                    negative_values = np.minimum(values, 0)
+                    
+                    # Plot positive values
+                    if np.any(positive_values > 0):
+                        ax.bar(x_offset, positive_values, width=bar_width, 
+                              color=term_color, alpha=0.8, label=f"{term_name} (+)")
+                    
+                    # Plot negative values with darker color
+                    if np.any(negative_values < 0):
+                        darker_color = np.array(term_color) * 0.6
+                        ax.bar(x_offset, negative_values, width=bar_width,
+                              color=darker_color, alpha=0.8, label=f"{term_name} (-)")
+                    idx += 1
+                
+                ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                plt.subplots_adjust(right=0.8)  # Make room for legend
+            
+        else:
+            # Simple bar chart if no components available
+            mean_rewards = []
+            for step in unique_steps:
+                step_mask = steps == step
+                mean_reward = np.mean(rewards[step_mask])
+                mean_rewards.append(mean_reward)
+            
+            mean_rewards = np.array(mean_rewards)
+            positive_rewards = np.maximum(mean_rewards, 0)
+            negative_rewards = np.minimum(mean_rewards, 0)
+            
+            ax.bar(unique_steps, positive_rewards, width=0.8, color='blue', alpha=0.7, label='Total Positive')
+            ax.bar(unique_steps, negative_rewards, width=0.8, color='red', alpha=0.7, label='Total Negative')
+            ax.legend()
+        
+        ax.set_xlabel("Episode timestep")
+        ax.set_ylabel("Mean reward")
+        if components_tensor:
+            ax.set_title(f"Mean Reward Components per Timestep (Iter {iteration}, {episode_counter} episodes) - Stacked")
+        else:
+            ax.set_title(f"Mean Total Reward per Timestep (Iter {iteration}, {episode_counter} episodes)")
+        ax.grid(True, alpha=0.3, axis='y')
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)  # Zero line
+        
+        # Use iteration number for global step to ensure monotonic increase
+        self.writer.add_figure("Step_Reward/mean_reward_components_per_timestep", fig, global_step=iteration)
+        plt.close(fig)  # Prevent memory leaks
+        
+        # Create individual plots for each reward term
+        if components_tensor:
+            self._log_individual_reward_histograms(unique_steps, component_means, iteration)
+
+    def _log_individual_reward_histograms(self, unique_steps, component_means, iteration):
+        """Create individual histogram plots for each reward term."""
+        for term_name, values in component_means.items():
+            fig, ax = plt.subplots(figsize=(8, 4))
+            values = np.array(values)
+            
+            # Split positive and negative values
+            positive_values = np.maximum(values, 0)
+            negative_values = np.minimum(values, 0)
+            
+            # Plot positive values in blue, negative in red
+            if np.any(positive_values > 0):
+                ax.bar(unique_steps, positive_values, width=0.8, color='blue', alpha=0.7, label='Positive')
+            if np.any(negative_values < 0):
+                ax.bar(unique_steps, negative_values, width=0.8, color='red', alpha=0.7, label='Negative')
+            
+            ax.set_xlabel("Episode timestep")
+            ax.set_ylabel("Mean reward")
+            ax.set_title(f"Reward Term: {term_name}")
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)  # Zero line
+            
+            # Add legend if both positive and negative values exist
+            if np.any(positive_values > 0) and np.any(negative_values < 0):
+                ax.legend()
+            
+            # Log individual term plot
+            safe_term_name = term_name.replace("/", "_").replace(" ", "_")
+            self.writer.add_figure(f"Step_Reward/{safe_term_name}", fig, global_step=iteration)
+            plt.close(fig)
+                
+    def _clear_reward_histogram_data(self):
+        """Clear the historical reward traces after logging."""
+        if self._historical_reward_traces is not None:
+            self._historical_reward_traces.clear()
+        # Reset episode counter for the next batch
+        self._hist_episode_counter = 0
 
     def save(self, path: str, infos=None):
         # -- Save model

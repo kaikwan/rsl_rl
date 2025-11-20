@@ -144,6 +144,24 @@ class GCUActorCritic(ActorCriticConv2d):
         
         return placement_entropy + orientation_entropy
 
+    @property
+    def placement_entropy(self):
+        """Compute entropy of placement distribution only."""
+        if self.placement_dist is None:
+            if self.device is None:
+                self.device = next(self.parameters()).device
+            return torch.tensor(0.0, device=self.device)
+        return self.placement_dist.entropy().sum(dim=-1)
+
+    @property
+    def orientation_entropy(self):
+        """Compute entropy of orientation distribution only."""
+        if self.orientation_dist is None:
+            if self.device is None:
+                self.device = next(self.parameters()).device
+            return torch.tensor(0.0, device=self.device)
+        return self.orientation_dist.entropy()
+
     def act_inference(self, observations):
         """Get deterministic actions for inference."""
         action_raw = self.actor(observations)
