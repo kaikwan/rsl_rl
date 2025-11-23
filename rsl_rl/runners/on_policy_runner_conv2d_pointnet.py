@@ -13,7 +13,7 @@ from collections import deque
 import rsl_rl
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import EmpiricalNormalization, GCUActorCriticConv2dPointNet
+from rsl_rl.modules import EmpiricalNormalization, GCUActorCriticConv2dPointNet, ActorCriticConv2dPointNetRecurrent
 from rsl_rl.runners import OnPolicyRunnerConv2d
 from rsl_rl.utils import store_code_state
 from rsl_rl.utils import normalize_and_flatten_image_obs
@@ -91,7 +91,7 @@ class OnPolicyRunnerConv2dPointNet(OnPolicyRunnerConv2d):
         num_image_obs = torch.prod(torch.tensor(input_image_shape)).item()
 
         # init the actor-critic networks
-        actor_critic: GCUActorCriticConv2dPointNet = GCUActorCriticConv2dPointNet(
+        actor_critic: ActorCriticConv2dPointNetRecurrent = ActorCriticConv2dPointNetRecurrent(
             num_obs, num_critic_obs, self.env.num_actions, input_image_shape, **self.policy_cfg
         ).to(self.device)
 

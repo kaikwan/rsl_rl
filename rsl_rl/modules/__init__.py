@@ -7,7 +7,7 @@
 
 from .actor_critic import ActorCritic
 from .actor_critic_conv2d import ActorCriticConv2d
-from .actor_critic_conv2d_pointnet import ActorCriticConv2dPointNet
+from .actor_critic_conv2d_pointnet import ActorCriticConv2dPointNet, ActorCriticConv2dPointNetRecurrent
 from .gcu_actor_critic import GCUActorCritic
 from .gcu_actor_critic_conv2d_pointnet import GCUActorCriticConv2dPointNet
 from .actor_critic_recurrent import ActorCriticRecurrent
@@ -20,6 +20,7 @@ __all__ = [
     "ActorCritic",
     "ActorCriticConv2d",
     "ActorCriticConv2dPointNet",
+    "ActorCriticConv2dPointNetRecurrent",
     "GCUActorCritic",
     "GCUActorCriticConv2dPointNet",
     "ActorCriticRecurrent",

@@ -243,6 +243,18 @@ class PPO:
             # original batch size
             original_batch_size = obs_batch.shape[0]
 
+            # Flatten 3D tensors from recurrent storage format to 2D
+            # Storage returns [time, batch, features] but policy expects [total_batch, features]
+            if target_values_batch.dim() == 3:
+                target_values_batch = target_values_batch.reshape(-1, target_values_batch.shape[-1])
+            if returns_batch.dim() == 3:
+                returns_batch = returns_batch.reshape(-1, returns_batch.shape[-1])
+            if advantages_batch.dim() == 3:
+                advantages_batch = advantages_batch.reshape(-1, advantages_batch.shape[-1])
+            if old_actions_log_prob_batch.dim() == 3:
+                old_actions_log_prob_batch = old_actions_log_prob_batch.reshape(-1, old_actions_log_prob_batch.shape[-1])
+            # Note: old_mu_batch and old_sigma_batch are handled in compute_kl_divergence
+
             # check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
