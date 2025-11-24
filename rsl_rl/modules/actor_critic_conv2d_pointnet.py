@@ -455,16 +455,19 @@ class ActorCriticConv2dPointNetRecurrent(ActorCriticConv2dPointNet):
         # This is the size of normalized Conv2D features after conv_linear and layernorm
         self.conv_feature_size = conv_linear_output_size
         
-        # Memory should process [proprio + Conv2D_features] instead of [proprio + raw_image]
-        # The RNN learns temporal dependencies in Conv2D features (not raw pixels)
-        # This is more efficient and allows RNN to learn meaningful temporal visual patterns
-        # Input size = num_actor_obs + conv_linear_output_size (e.g., 4096 + 256 = 4352)
-        self.memory_a = Memory(num_actor_obs + self.conv_feature_size, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        self.memory_c = Memory(num_critic_obs + self.conv_feature_size, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        # Get PointNet encoded feature size from actor network
+        self.encoded_pointnet_size = self.actor.encoded_pointnet_size
+        
+        # Memory should process [PointNet_features + Conv2D_features] instead of [proprio + raw_image]
+        # The RNN learns temporal dependencies in both PointNet and Conv2D features (not raw data)
+        # This is more efficient and allows RNN to learn meaningful temporal patterns
+        # Input size = encoded_pointnet_size + conv_linear_output_size (e.g., 256 + 128 = 384)
+        self.memory_a = Memory(self.encoded_pointnet_size + self.conv_feature_size, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_c = Memory(self.encoded_pointnet_size + self.conv_feature_size, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
 
-        print(f"Actor RNN: {self.memory_a} (input size: {num_actor_obs + self.conv_feature_size})")
-        print(f"Critic RNN: {self.memory_c} (input size: {num_critic_obs + self.conv_feature_size})")
-        print(f"RNN processes [proprio ({num_actor_obs}) + Conv2D_features ({self.conv_feature_size})] instead of raw pixels")
+        print(f"Actor RNN: {self.memory_a} (input size: {self.encoded_pointnet_size + self.conv_feature_size})")
+        print(f"Critic RNN: {self.memory_c} (input size: {self.encoded_pointnet_size + self.conv_feature_size})")
+        print(f"RNN processes [PointNet_features ({self.encoded_pointnet_size}) + Conv2D_features ({self.conv_feature_size})] instead of raw data")
 
         # Separate distributions for placement and orientation
         self.placement_dist = None
@@ -474,6 +477,43 @@ class ActorCriticConv2dPointNetRecurrent(ActorCriticConv2dPointNet):
         # Initialize device after super().__init__ to ensure parameters are available
         self.device = None
     
+    def extract_pointnet_features(self, proprio_obs, network):
+        """Extract PointNet features from raw proprioceptive observations.
+        
+        Args:
+            proprio_obs: Raw proprioceptive observations [batch, proprio_size] or [seq_len, batch, proprio_size]
+            network: The ConvolutionalNetworkWithPointNet to extract features from (actor or critic)
+        
+        Returns:
+            pointnet_features: PointNet encoded features [batch, encoded_pointnet_size] or [seq_len, batch, encoded_pointnet_size]
+        """
+        # Handle both 2D (inference) and 3D (batch training) cases
+        is_3d = proprio_obs.dim() == 3
+        if is_3d:
+            seq_len, batch_size, _ = proprio_obs.shape
+            proprio_obs_flat = proprio_obs.reshape(-1, proprio_obs.shape[-1])  # [seq_len * batch, proprio_size]
+        else:
+            batch_size = proprio_obs.shape[0]
+            proprio_obs_flat = proprio_obs
+        
+        # Handle empty batch
+        if batch_size == 0:
+            if is_3d:
+                return torch.empty(seq_len, 0, network.encoded_pointnet_size, device=proprio_obs.device, dtype=proprio_obs.dtype)
+            else:
+                return torch.empty(0, network.encoded_pointnet_size, device=proprio_obs.device, dtype=proprio_obs.dtype)
+        
+        # Process through PointNet encoder
+        # Reshape to [batch, pointnet_in_dim, pointnet_num_points] format
+        pointnet_input = proprio_obs_flat.view(-1, network.pointnet_in_dim, network.pointnet_num_points)
+        pointnet_features = network.pointnet_encoder(pointnet_input)  # [batch, encoded_pointnet_size]
+        
+        # Reshape back to original structure if 3D
+        if is_3d:
+            pointnet_features = pointnet_features.reshape(seq_len, batch_size, -1)  # [seq_len, batch, encoded_pointnet_size]
+        
+        return pointnet_features
+
     def extract_conv_features(self, image_obs, network):
         """Extract Conv2D features from raw image observations.
         
@@ -547,12 +587,15 @@ class ActorCriticConv2dPointNetRecurrent(ActorCriticConv2dPointNet):
             proprio_obs_padded = observations[:, :, :self.num_proprio_obs]  # [seq_len, batch, proprio_size]
             image_obs_padded = observations[:, :, self.num_proprio_obs:]  # [seq_len, batch, image_size]
             
+            # Extract PointNet features from proprioceptive observations (keep padded format)
+            pointnet_features_padded = self.extract_pointnet_features(proprio_obs_padded, self.actor)  # [seq_len, batch, encoded_pointnet_size]
+            
             # Extract Conv2D features from images (keep padded format)
             conv_features_padded = self.extract_conv_features(image_obs_padded, self.actor)  # [seq_len, batch, conv_feature_size]
             
-            # Concatenate [proprio + conv_features] for RNN input (keep padded format)
+            # Concatenate [PointNet_features + Conv2D_features] for RNN input (keep padded format)
             # Memory module expects padded input and will handle unpadding internally
-            rnn_input = torch.cat([proprio_obs_padded, conv_features_padded], dim=-1)  # [seq_len, batch, proprio_size + conv_feature_size]
+            rnn_input = torch.cat([pointnet_features_padded, conv_features_padded], dim=-1)  # [seq_len, batch, encoded_pointnet_size + conv_feature_size]
             
             # Process through RNN (Memory handles unpadding internally)
             # Input: [seq_len, batch, features] (padded)
@@ -568,11 +611,14 @@ class ActorCriticConv2dPointNetRecurrent(ActorCriticConv2dPointNet):
             proprio_obs = observations[:, :self.num_proprio_obs]  # [batch, proprio_size]
             image_obs = observations[:, self.num_proprio_obs:]  # [batch, image_size]
             
+            # Extract PointNet features from proprioceptive observations
+            pointnet_features = self.extract_pointnet_features(proprio_obs, self.actor)  # [batch, encoded_pointnet_size]
+            
             # Extract Conv2D features from images
             conv_features = self.extract_conv_features(image_obs, self.actor)  # [batch, conv_feature_size]
             
-            # Concatenate [proprio + conv_features] for RNN input
-            rnn_input = torch.cat([proprio_obs, conv_features], dim=-1)  # [batch, proprio_size + conv_feature_size]
+            # Concatenate [PointNet_features + Conv2D_features] for RNN input
+            rnn_input = torch.cat([pointnet_features, conv_features], dim=-1)  # [batch, encoded_pointnet_size + conv_feature_size]
             
             # Process through RNN
             rnn_output = self.memory_a(rnn_input, masks, hidden_states)  # [1, batch, rnn_hidden_dim]
@@ -704,15 +750,18 @@ class ActorCriticConv2dPointNetRecurrent(ActorCriticConv2dPointNet):
 
     def act_inference(self, observations):
         """Get deterministic actions for inference."""
-        # Extract Conv2D features from images first (before RNN)
+        # Extract PointNet and Conv2D features first (before RNN)
         proprio_obs = observations[:, :self.num_proprio_obs]  # [batch, proprio_size]
         image_obs = observations[:, self.num_proprio_obs:]  # [batch, image_size]
+        
+        # Extract PointNet features from proprioceptive observations
+        pointnet_features = self.extract_pointnet_features(proprio_obs, self.actor)  # [batch, encoded_pointnet_size]
         
         # Extract Conv2D features from images
         conv_features = self.extract_conv_features(image_obs, self.actor)  # [batch, conv_feature_size]
         
-        # Concatenate [proprio + conv_features] for RNN input
-        rnn_input = torch.cat([proprio_obs, conv_features], dim=-1)  # [batch, proprio_size + conv_feature_size]
+        # Concatenate [PointNet_features + Conv2D_features] for RNN input
+        rnn_input = torch.cat([pointnet_features, conv_features], dim=-1)  # [batch, encoded_pointnet_size + conv_feature_size]
         
         # Process through RNN
         rnn_output = self.memory_a(rnn_input)  # [1, batch, rnn_hidden_dim]
@@ -823,19 +872,22 @@ class ActorCriticConv2dPointNetRecurrent(ActorCriticConv2dPointNet):
     
     def evaluate(self, critic_observations, masks=None, hidden_states=None):
         """Evaluate critic with recurrent memory."""
-        # Extract Conv2D features from images first (before RNN)
-        # This allows RNN to learn temporal patterns in visual features, not raw pixels
+        # Extract PointNet and Conv2D features first (before RNN)
+        # This allows RNN to learn temporal patterns in processed features, not raw data
         if masks is not None:
             # Batch mode: observations is [seq_len, batch, obs_features]
             proprio_obs_padded = critic_observations[:, :, :self.num_proprio_obs]  # [seq_len, batch, proprio_size]
             image_obs_padded = critic_observations[:, :, self.num_proprio_obs:]  # [seq_len, batch, image_size]
             
+            # Extract PointNet features from proprioceptive observations (keep padded format)
+            pointnet_features_padded = self.extract_pointnet_features(proprio_obs_padded, self.critic)  # [seq_len, batch, encoded_pointnet_size]
+            
             # Extract Conv2D features from images (keep padded format)
             conv_features_padded = self.extract_conv_features(image_obs_padded, self.critic)  # [seq_len, batch, conv_feature_size]
             
-            # Concatenate [proprio + conv_features] for RNN input (keep padded format)
+            # Concatenate [PointNet_features + Conv2D_features] for RNN input (keep padded format)
             # Memory module expects padded input and will handle unpadding internally
-            rnn_input = torch.cat([proprio_obs_padded, conv_features_padded], dim=-1)  # [seq_len, batch, proprio_size + conv_feature_size]
+            rnn_input = torch.cat([pointnet_features_padded, conv_features_padded], dim=-1)  # [seq_len, batch, encoded_pointnet_size + conv_feature_size]
             
             # Process through RNN (Memory handles unpadding internally)
             # Input: [seq_len, batch, features] (padded)
@@ -855,11 +907,14 @@ class ActorCriticConv2dPointNetRecurrent(ActorCriticConv2dPointNet):
             proprio_obs = critic_observations[:, :self.num_proprio_obs]  # [batch, proprio_size]
             image_obs = critic_observations[:, self.num_proprio_obs:]  # [batch, image_size]
             
+            # Extract PointNet features from proprioceptive observations
+            pointnet_features = self.extract_pointnet_features(proprio_obs, self.critic)  # [batch, encoded_pointnet_size]
+            
             # Extract Conv2D features from images
             conv_features = self.extract_conv_features(image_obs, self.critic)  # [batch, conv_feature_size]
             
-            # Concatenate [proprio + conv_features] for RNN input
-            rnn_input = torch.cat([proprio_obs, conv_features], dim=-1)  # [batch, proprio_size + conv_feature_size]
+            # Concatenate [PointNet_features + Conv2D_features] for RNN input
+            rnn_input = torch.cat([pointnet_features, conv_features], dim=-1)  # [batch, encoded_pointnet_size + conv_feature_size]
             
             # Process through RNN
             rnn_output = self.memory_c(rnn_input, masks, hidden_states)  # [1, batch, rnn_hidden_dim]
