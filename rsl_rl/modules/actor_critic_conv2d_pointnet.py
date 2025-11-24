@@ -86,7 +86,7 @@ class ConvolutionalNetworkWithPointNet(nn.Module):
         self.conv_linear = nn.Linear(self.image_feature_size, conv_linear_output_size)
         self.layernorm = nn.LayerNorm(conv_linear_output_size)
 
-        # Build the mlp
+        # Build the mlp for raw observations (proprio + image)
         self.mlp = nn.Sequential(
             nn.Linear(self.encoded_pointnet_size + conv_linear_output_size, hidden_dims[0]),
             self.activation_fn,
@@ -97,6 +97,22 @@ class ConvolutionalNetworkWithPointNet(nn.Module):
             ],
             nn.Linear(hidden_dims[-1], output_dim),
         )
+        
+        # Build alternative mlp for RNN-only input (when use_projection=True, i.e., recurrent mode)
+        # This MLP only takes pointnet_features (RNN output projected to pointnet size)
+        if self.use_projection:
+            self.mlp_rnn_only = nn.Sequential(
+                nn.Linear(self.encoded_pointnet_size, hidden_dims[0]),
+                self.activation_fn,
+                *[
+                    layer
+                    for dim in zip(hidden_dims[:-1], hidden_dims[1:])
+                    for layer in (nn.Linear(dim[0], dim[1]), self.activation_fn)
+                ],
+                nn.Linear(hidden_dims[-1], output_dim),
+            )
+        else:
+            self.mlp_rnn_only = None
         
         # Store output dimension for JIT compatibility (avoid computing in forward)
         self.output_dim = output_dim
@@ -201,44 +217,76 @@ class ConvolutionalNetworkWithPointNet(nn.Module):
                 nn.init.orthogonal_(layer.weight, gain=0.01)
                 nn.init.zeros_(layer.bias) if layer.bias is not None else None
         
+        # Initialize RNN-only MLP if it exists
+        if self.mlp_rnn_only is not None:
+            for layer in self.mlp_rnn_only:
+                if isinstance(layer, nn.Linear):
+                    nn.init.orthogonal_(layer.weight, gain=0.01)
+                    nn.init.zeros_(layer.bias) if layer.bias is not None else None
+        
         # Initialize projection layer if it exists
         if self.use_projection:
             nn.init.orthogonal_(self.proprio_projection.weight, gain=0.01)
             nn.init.zeros_(self.proprio_projection.bias) if self.proprio_projection.bias is not None else None
 
     def forward(self, observations):
-        proprio_obs = observations[:, : -self.image_obs_size]
-        image_obs = observations[:, -self.image_obs_size :]
+        # Detect input format:
+        # 1. RNN-only: just RNN output (size = proprio_input_dim) - used in recurrent mode
+        # 2. Raw: [proprio, raw_image] (size = proprio_input_dim + image_obs_size)
+        expected_rnn_only_size = self.proprio_obs_size  # Just RNN output
+        expected_raw_size = self.proprio_obs_size + self.image_obs_size
+        actual_size = observations.shape[-1]
         
-        # Process proprioceptive observations based on initialization flag (JIT-compatible)
-        # This avoids dynamic shape checks that JIT doesn't support
-        if self.use_projection:
-            # RNN output case: project to match PointNet encoder output size
-            pointnet_features = self.proprio_projection(proprio_obs)
+        if actual_size == expected_rnn_only_size and self.use_projection:
+            # RNN-only input: just RNN output (recurrent mode)
+            # RNN output already contains temporal information about both proprio and Conv2D features
+            rnn_output = observations  # [batch, rnn_hidden_dim]
+            
+            # Project RNN output to pointnet_features size
+            pointnet_features = self.proprio_projection(rnn_output)  # [batch, encoded_pointnet_size]
+            
+            # Use RNN-only MLP (only takes pointnet_features)
+            output = self.mlp_rnn_only(pointnet_features)
+            return output
+        elif actual_size == expected_raw_size:
+            # Raw observations: [proprio, raw_image]
+            proprio_obs = observations[:, :self.proprio_obs_size]
+            image_obs = observations[:, self.proprio_obs_size:]
+            
+            # Process proprioceptive observations based on initialization flag (JIT-compatible)
+            if self.use_projection:
+                # RNN output case: project to match PointNet encoder output size
+                pointnet_features = self.proprio_projection(proprio_obs)
+            else:
+                # Raw observations case: process through PointNet
+                pointnet_features = self.pointnet_encoder(proprio_obs.view(-1, self.pointnet_in_dim, self.pointnet_num_points))
+
+            batch_size = image_obs.size(0)
+            
+            # Handle empty batch case (use stored output_dim for JIT compatibility)
+            if batch_size == 0:
+                # Return empty tensor with correct output shape
+                return torch.empty(0, self.output_dim, device=observations.device, dtype=observations.dtype)
+            
+            image = image_obs.view(batch_size, *self.image_input_shape)
+
+            conv_features = self.conv_net(image)
+            
+            # Handle empty conv_features case (use stored output_dim for JIT compatibility)
+            if conv_features.numel() == 0:
+                return torch.empty(0, self.output_dim, device=observations.device, dtype=observations.dtype)
+            
+            flattened_conv_features = conv_features.view(batch_size, -1)
+            normalized_conv_output = self.layernorm(self.conv_linear(flattened_conv_features))
+            combined_input = torch.cat([pointnet_features, normalized_conv_output], dim=1)
+            output = self.mlp(combined_input)
+            return output
         else:
-            # Raw observations case: process through PointNet
-            pointnet_features = self.pointnet_encoder(proprio_obs.view(-1, self.pointnet_in_dim, self.pointnet_num_points))
-
-        batch_size = image_obs.size(0)
-        
-        # Handle empty batch case (use stored output_dim for JIT compatibility)
-        if batch_size == 0:
-            # Return empty tensor with correct output shape
-            return torch.empty(0, self.output_dim, device=observations.device, dtype=observations.dtype)
-        
-        image = image_obs.view(batch_size, *self.image_input_shape)
-
-        conv_features = self.conv_net(image)
-        
-        # Handle empty conv_features case (use stored output_dim for JIT compatibility)
-        if conv_features.numel() == 0:
-            return torch.empty(0, self.output_dim, device=observations.device, dtype=observations.dtype)
-        
-        flattened_conv_features = conv_features.view(batch_size, -1)
-        normalized_conv_output = self.layernorm(self.conv_linear(flattened_conv_features))
-        combined_input = torch.cat([pointnet_features, normalized_conv_output], dim=1)
-        output = self.mlp(combined_input)
-        return output
+            raise ValueError(
+                f"Unexpected input size {actual_size}. Expected either "
+                f"{expected_rnn_only_size} (RNN-only output, recurrent mode) or "
+                f"{expected_raw_size} (raw: [proprio, raw_image])"
+            )
 
 
 
@@ -403,14 +451,20 @@ class ActorCriticConv2dPointNetRecurrent(ActorCriticConv2dPointNet):
         self.num_proprio_obs = num_actor_obs  # Proprioceptive observation size (4096)
         self.num_image_obs = num_image_obs    # Image observation size (1924)
         
-        # Memory should process the full concatenated observations (proprio + image)
-        # The RNN maintains temporal dependencies across both proprioceptive and image features
-        # Full observation size = num_actor_obs + num_image_obs (4096 + 1924 = 6020)
-        self.memory_a = Memory(num_actor_obs + num_image_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        self.memory_c = Memory(num_critic_obs + num_image_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        # Get Conv2D feature size from actor network (conv_linear_output_size)
+        # This is the size of normalized Conv2D features after conv_linear and layernorm
+        self.conv_feature_size = conv_linear_output_size
+        
+        # Memory should process [proprio + Conv2D_features] instead of [proprio + raw_image]
+        # The RNN learns temporal dependencies in Conv2D features (not raw pixels)
+        # This is more efficient and allows RNN to learn meaningful temporal visual patterns
+        # Input size = num_actor_obs + conv_linear_output_size (e.g., 4096 + 256 = 4352)
+        self.memory_a = Memory(num_actor_obs + self.conv_feature_size, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_c = Memory(num_critic_obs + self.conv_feature_size, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
 
-        print(f"Actor RNN: {self.memory_a}")
-        print(f"Critic RNN: {self.memory_c}")
+        print(f"Actor RNN: {self.memory_a} (input size: {num_actor_obs + self.conv_feature_size})")
+        print(f"Critic RNN: {self.memory_c} (input size: {num_critic_obs + self.conv_feature_size})")
+        print(f"RNN processes [proprio ({num_actor_obs}) + Conv2D_features ({self.conv_feature_size})] instead of raw pixels")
 
         # Separate distributions for placement and orientation
         self.placement_dist = None
@@ -419,6 +473,46 @@ class ActorCriticConv2dPointNetRecurrent(ActorCriticConv2dPointNet):
         # Store device for KL divergence calculation
         # Initialize device after super().__init__ to ensure parameters are available
         self.device = None
+    
+    def extract_conv_features(self, image_obs, network):
+        """Extract Conv2D features from raw image observations.
+        
+        Args:
+            image_obs: Raw image observations [batch, image_obs_size] or [seq_len, batch, image_obs_size]
+            network: The ConvolutionalNetworkWithPointNet to extract features from (actor or critic)
+        
+        Returns:
+            conv_features: Normalized Conv2D features [batch, conv_feature_size] or [seq_len, batch, conv_feature_size]
+        """
+        # Handle both 2D (inference) and 3D (batch training) cases
+        is_3d = image_obs.dim() == 3
+        if is_3d:
+            seq_len, batch_size, _ = image_obs.shape
+            image_obs_flat = image_obs.reshape(-1, image_obs.shape[-1])  # [seq_len * batch, image_obs_size]
+        else:
+            batch_size = image_obs.shape[0]
+            image_obs_flat = image_obs
+        
+        # Handle empty batch
+        if batch_size == 0:
+            if is_3d:
+                return torch.empty(seq_len, 0, self.conv_feature_size, device=image_obs.device, dtype=image_obs.dtype)
+            else:
+                return torch.empty(0, self.conv_feature_size, device=image_obs.device, dtype=image_obs.dtype)
+        
+        # Reshape to image format
+        image = image_obs_flat.view(-1, *network.image_input_shape)  # [batch, C, H, W]
+        
+        # Extract Conv2D features
+        conv_features = network.conv_net(image)  # [batch, out_channels, H', W']
+        flattened_conv_features = conv_features.view(conv_features.shape[0], -1)  # [batch, image_feature_size]
+        normalized_conv_features = network.layernorm(network.conv_linear(flattened_conv_features))  # [batch, conv_feature_size]
+        
+        # Reshape back to original structure if 3D
+        if is_3d:
+            normalized_conv_features = normalized_conv_features.reshape(seq_len, batch_size, -1)  # [seq_len, batch, conv_feature_size]
+        
+        return normalized_conv_features
 
     def update_distribution(self, observations):
         """Update both placement and orientation distributions."""
@@ -446,40 +540,50 @@ class ActorCriticConv2dPointNetRecurrent(ActorCriticConv2dPointNet):
         self.distribution = Normal(action_raw, torch.ones_like(action_raw))
 
     def act(self, observations, masks=None, hidden_states=None):
-        # Process full observations (proprio + image) through RNN
-        # RNN maintains temporal dependencies across both proprioceptive and image features
-        rnn_output = self.memory_a(observations, masks, hidden_states)
-        
-        # Extract image observations - need to handle batch mode (with masks) vs inference mode
+        # Extract Conv2D features from images first (before RNN)
+        # This allows RNN to learn temporal patterns in visual features, not raw pixels
         if masks is not None:
             # Batch mode: observations is [seq_len, batch, obs_features]
-            # RNN output after unpad_trajectories has shape [seq_len, num_valid, hidden_dim]
-            # Extract image part from full observations: [seq_len, batch, image_features]
-            image_obs_padded = observations[:, :, self.num_proprio_obs:]
-            # Apply same unpad logic as RNN output
-            image_obs = unpad_trajectories(image_obs_padded, masks)
-            # Both rnn_output and image_obs have shape [seq_len, num_valid, features]
-            # They should have the same seq_len and num_valid since they use the same masks
-            seq_len = rnn_output.shape[0]
-            num_valid = rnn_output.shape[1]
+            proprio_obs_padded = observations[:, :, :self.num_proprio_obs]  # [seq_len, batch, proprio_size]
+            image_obs_padded = observations[:, :, self.num_proprio_obs:]  # [seq_len, batch, image_size]
             
-            # Ensure shapes match
-            assert image_obs.shape[0] == seq_len, \
-                f"Image obs seq_len {image_obs.shape[0]} doesn't match RNN seq_len {seq_len}"
-            assert image_obs.shape[1] == num_valid, \
-                f"Image obs num_valid {image_obs.shape[1]} doesn't match RNN num_valid {num_valid}"
+            # Extract Conv2D features from images (keep padded format)
+            conv_features_padded = self.extract_conv_features(image_obs_padded, self.actor)  # [seq_len, batch, conv_feature_size]
             
-            # Flatten to [seq_len * num_valid, features] (which equals [total_batch, features])
-            rnn_output = rnn_output.reshape(-1, rnn_output.shape[-1])  # [seq_len * num_valid, rnn_hidden_dim]
-            image_obs = image_obs.reshape(-1, image_obs.shape[-1])  # [seq_len * num_valid, image_features]
+            # Concatenate [proprio + conv_features] for RNN input (keep padded format)
+            # Memory module expects padded input and will handle unpadding internally
+            rnn_input = torch.cat([proprio_obs_padded, conv_features_padded], dim=-1)  # [seq_len, batch, proprio_size + conv_feature_size]
+            
+            # Process through RNN (Memory handles unpadding internally)
+            # Input: [seq_len, batch, features] (padded)
+            # Hidden states: [num_layers, batch, hidden_dim] (matches padded batch size)
+            # Output: [seq_len, num_valid, hidden_dim] (unpadded)
+            rnn_output = self.memory_a(rnn_input, masks, hidden_states)  # [seq_len, num_valid, rnn_hidden_dim]
+            
+            # Flatten for actor input
+            seq_len, num_valid = rnn_output.shape[0], rnn_output.shape[1]
+            rnn_output_flat = rnn_output.reshape(-1, rnn_output.shape[-1])  # [seq_len * num_valid, rnn_hidden_dim]
         else:
             # Inference mode: observations is [batch, obs_features]
+            proprio_obs = observations[:, :self.num_proprio_obs]  # [batch, proprio_size]
+            image_obs = observations[:, self.num_proprio_obs:]  # [batch, image_size]
+            
+            # Extract Conv2D features from images
+            conv_features = self.extract_conv_features(image_obs, self.actor)  # [batch, conv_feature_size]
+            
+            # Concatenate [proprio + conv_features] for RNN input
+            rnn_input = torch.cat([proprio_obs, conv_features], dim=-1)  # [batch, proprio_size + conv_feature_size]
+            
+            # Process through RNN
+            rnn_output = self.memory_a(rnn_input, masks, hidden_states)  # [1, batch, rnn_hidden_dim]
             rnn_output = rnn_output.squeeze(0)  # [batch, rnn_hidden_dim]
-            image_obs = observations[:, self.num_proprio_obs:]  # [batch, image_features]
         
-        # Concatenate RNN output with image observations to pass to actor
-        # Actor expects [proprio_features, image_obs] where proprio_features is rnn_hidden_dim
-        actor_input = torch.cat([rnn_output, image_obs], dim=1)
+        # RNN output already contains temporal information about both proprio and Conv2D features
+        # No need to add Conv2D features again - RNN has already processed them
+        if masks is not None:
+            actor_input = rnn_output_flat  # [seq_len * num_valid, rnn_hidden_dim]
+        else:
+            actor_input = rnn_output  # [batch, rnn_hidden_dim]
         
         self.update_distribution(actor_input)
         
@@ -600,15 +704,23 @@ class ActorCriticConv2dPointNetRecurrent(ActorCriticConv2dPointNet):
 
     def act_inference(self, observations):
         """Get deterministic actions for inference."""
-        # Process full observations (proprio + image) through RNN
-        rnn_output = self.memory_a(observations)
+        # Extract Conv2D features from images first (before RNN)
+        proprio_obs = observations[:, :self.num_proprio_obs]  # [batch, proprio_size]
+        image_obs = observations[:, self.num_proprio_obs:]  # [batch, image_size]
+        
+        # Extract Conv2D features from images
+        conv_features = self.extract_conv_features(image_obs, self.actor)  # [batch, conv_feature_size]
+        
+        # Concatenate [proprio + conv_features] for RNN input
+        rnn_input = torch.cat([proprio_obs, conv_features], dim=-1)  # [batch, proprio_size + conv_feature_size]
+        
+        # Process through RNN
+        rnn_output = self.memory_a(rnn_input)  # [1, batch, rnn_hidden_dim]
         rnn_output = rnn_output.squeeze(0)  # [batch, rnn_hidden_dim]
         
-        # Split observations to get image part
-        image_obs = observations[:, self.num_proprio_obs:]
-        
-        # Concatenate RNN output with image observations to pass to actor
-        actor_input = torch.cat([rnn_output, image_obs], dim=1)
+        # RNN output already contains temporal information about both proprio and Conv2D features
+        # No need to add Conv2D features again
+        actor_input = rnn_output
         
         action_raw = self.actor(actor_input)
         
@@ -711,38 +823,51 @@ class ActorCriticConv2dPointNetRecurrent(ActorCriticConv2dPointNet):
     
     def evaluate(self, critic_observations, masks=None, hidden_states=None):
         """Evaluate critic with recurrent memory."""
-        # Process full observations (proprio + image) through RNN
-        rnn_output = self.memory_c(critic_observations, masks, hidden_states)
-        
-        # Extract image observations - need to handle batch mode (with masks) vs inference mode
+        # Extract Conv2D features from images first (before RNN)
+        # This allows RNN to learn temporal patterns in visual features, not raw pixels
         if masks is not None:
             # Batch mode: observations is [seq_len, batch, obs_features]
-            # RNN output after unpad_trajectories has shape [seq_len, num_valid, hidden_dim]
-            # Extract image part from full observations: [seq_len, batch, image_features]
-            image_obs_padded = critic_observations[:, :, self.num_proprio_obs:]
-            # Apply same unpad logic as RNN output
-            image_obs = unpad_trajectories(image_obs_padded, masks)
-            # Both rnn_output and image_obs have shape [seq_len, num_valid, features]
-            # They should have the same seq_len and num_valid since they use the same masks
-            seq_len = rnn_output.shape[0]
-            num_valid = rnn_output.shape[1]
+            proprio_obs_padded = critic_observations[:, :, :self.num_proprio_obs]  # [seq_len, batch, proprio_size]
+            image_obs_padded = critic_observations[:, :, self.num_proprio_obs:]  # [seq_len, batch, image_size]
             
-            # Ensure shapes match
-            assert image_obs.shape[0] == seq_len, \
-                f"Image obs seq_len {image_obs.shape[0]} doesn't match RNN seq_len {seq_len}"
-            assert image_obs.shape[1] == num_valid, \
-                f"Image obs num_valid {image_obs.shape[1]} doesn't match RNN num_valid {num_valid}"
+            # Extract Conv2D features from images (keep padded format)
+            conv_features_padded = self.extract_conv_features(image_obs_padded, self.critic)  # [seq_len, batch, conv_feature_size]
             
-            # Flatten to [seq_len * num_valid, features] (which equals [total_batch, features])
-            rnn_output = rnn_output.reshape(-1, rnn_output.shape[-1])  # [seq_len * num_valid, rnn_hidden_dim]
-            image_obs = image_obs.reshape(-1, image_obs.shape[-1])  # [seq_len * num_valid, image_features]
+            # Concatenate [proprio + conv_features] for RNN input (keep padded format)
+            # Memory module expects padded input and will handle unpadding internally
+            rnn_input = torch.cat([proprio_obs_padded, conv_features_padded], dim=-1)  # [seq_len, batch, proprio_size + conv_feature_size]
+            
+            # Process through RNN (Memory handles unpadding internally)
+            # Input: [seq_len, batch, features] (padded)
+            # Hidden states: [num_layers, batch, hidden_dim] (matches padded batch size)
+            # Output: [seq_len, num_valid, hidden_dim] (unpadded)
+            rnn_output = self.memory_c(rnn_input, masks, hidden_states)  # [seq_len, num_valid, rnn_hidden_dim]
+            
+            # Flatten for critic input
+            seq_len, num_valid = rnn_output.shape[0], rnn_output.shape[1]
+            rnn_output_flat = rnn_output.reshape(-1, rnn_output.shape[-1])  # [seq_len * num_valid, rnn_hidden_dim]
+            
+            # RNN output already contains temporal information about both proprio and Conv2D features
+            # No need to add Conv2D features again
+            critic_input = rnn_output_flat
         else:
             # Inference mode: observations is [batch, obs_features]
+            proprio_obs = critic_observations[:, :self.num_proprio_obs]  # [batch, proprio_size]
+            image_obs = critic_observations[:, self.num_proprio_obs:]  # [batch, image_size]
+            
+            # Extract Conv2D features from images
+            conv_features = self.extract_conv_features(image_obs, self.critic)  # [batch, conv_feature_size]
+            
+            # Concatenate [proprio + conv_features] for RNN input
+            rnn_input = torch.cat([proprio_obs, conv_features], dim=-1)  # [batch, proprio_size + conv_feature_size]
+            
+            # Process through RNN
+            rnn_output = self.memory_c(rnn_input, masks, hidden_states)  # [1, batch, rnn_hidden_dim]
             rnn_output = rnn_output.squeeze(0)  # [batch, rnn_hidden_dim]
-            image_obs = critic_observations[:, self.num_proprio_obs:]  # [batch, image_features]
-        
-        # Concatenate RNN output with image observations to pass to critic
-        critic_input = torch.cat([rnn_output, image_obs], dim=1)
+            
+            # RNN output already contains temporal information about both proprio and Conv2D features
+            # No need to add Conv2D features again
+            critic_input = rnn_output
         
         value = self.critic(critic_input)
         return value
